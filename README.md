@@ -1,10 +1,11 @@
-# agentic-sdlc-loop
+# kube-loop
 
 A minimal demo of an **AI coding agent that closes the SDLC loop** on Kubernetes: write code → deploy → execute → observe telemetry → reason → iterate.
 
 ## What it does
 
-An OpenHands agent running locally is given a task. It writes a FastAPI service, builds a Docker image, deploys it to a local Kubernetes cluster, calls the API, reads pod logs and telemetry, and produces an analysis that informs the next iteration. Every LLM call is captured as a trace.
+An AI coding agent is given a software development task. It writes the code, deploys it to a Kubernetes cluster, exercises it, observes the resulting behavior through telemetry, and uses what it learns to drive the next iteration — closing the build-observe-iterate loop autonomously.
+
 
 ## Stack
 
@@ -15,7 +16,6 @@ An OpenHands agent running locally is given a task. It writes a FastAPI service,
 | Telemetry | OpenLIT (OTLP traces + ClickHouse store) |
 | Workload | FastAPI app deployed as a Kubernetes Deployment + NodePort Service |
 
-No ARK, no Argo, no Temporal — just the minimum to demonstrate the loop pattern.
 
 ## Architecture
 
