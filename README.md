@@ -35,6 +35,9 @@ An AI coding agent is given a software development task. It writes the code, dep
             ▼
        LLM API (OpenAI / Anthropic)
 ```
+### Why use OpenHands
+
+Both OpenHands and OpenCode are open-source coding agents, but they target different use cases. OpenCode is a terminal-first interactive assistant optimized for human-in-the-loop pair programming. OpenHands is a programmable agent runtime with a Python SDK and first-class primitives for Agent, Conversation, and Tool — designed to be embedded in larger systems and run headlessly. For closing the SDLC loop programmatically, where iterations are driven by a script rather than a human at a terminal, OpenHands' SDK and native support for sandboxed Kubernetes execution make it the better substrate.
 
 ## Quick start
 
