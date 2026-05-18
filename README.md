@@ -41,6 +41,14 @@ Both OpenHands and OpenCode are open-source coding agents, but they target diffe
 
 ## Quick start
 
+After cloing the repo
+```bash
+chmod +x setup.sh
+./setup.sh
+```
+
+The following instructions are more hands-on installation steps that describe how the stack is setup.
+
 ```bash
 # 1. Prerequisites
 brew install colima docker kubectl helm node@20 python@3.12
