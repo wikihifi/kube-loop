@@ -1,37 +1,135 @@
+"""
+demo_loop.py — Closed-loop SDLC demo
+
+Runs N iterations where each one:
+  1. Reads the previous iteration's pod logs and OTEL telemetry
+  2. Decides ONE concrete improvement based on what it observed
+  3. Modifies the code, rebuilds, and redeploys with a new version tag
+  4. Calls all endpoints and records what changed and why
+
+After the loop, you can:
+  - Diff /tmp/demo-api/main.py.v1 vs main.py.v2 vs main.py.v3 to see code evolution
+  - Read /tmp/demo-api/iteration_N_why.md to see what telemetry drove each change
+  - Curl /version on the live service to see the iteration counter advance
+"""
+
 import os
+import sys
+import json
+import subprocess
+import time
+from pathlib import Path
+
 import openlit
 from openhands.sdk import LLM, Agent, Conversation
 from openhands.sdk.tool import Tool, register_tool
 from openhands.tools.terminal import TerminalTool
 from openhands.tools.file_editor import FileEditorTool
 
-# Register tools (required for openhands-sdk 1.22.x)
+# ----- Tool registration -----
 register_tool("TerminalTool", TerminalTool)
 register_tool("FileEditorTool", FileEditorTool)
 
-# Initialize telemetry
-openlit.init(otlp_endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
+# ----- Telemetry init -----
+openlit.init(
+    otlp_endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
+)
 
-llm = LLM(model=os.getenv("LLM_MODEL"), api_key=os.getenv("LLM_API_KEY"))
-COLIMA_IP = os.getenv("COLIMA_IP", "192.168.64.2")
+# ----- Config -----
+NUM_ITERATIONS = int(os.getenv("NUM_ITERATIONS", "3"))
 WORK_DIR = "/tmp/demo-api"
+LLM_MODEL = os.getenv("LLM_MODEL")
+LLM_API_KEY = os.getenv("LLM_API_KEY")
 
-# Ensure workspace exists before the agent runs
-os.makedirs(WORK_DIR, exist_ok=True)
+if not LLM_API_KEY or not LLM_MODEL:
+    sys.exit("ERROR: LLM_API_KEY and LLM_MODEL env vars are required")
 
-ITERATION_1_TASK = f"""
-You are an SDLC automation agent. Execute these steps in order.
-After each step, briefly confirm it succeeded before moving on.
+llm = LLM(model=LLM_MODEL, api_key=LLM_API_KEY)
 
-1. Create /tmp/demo-api/main.py with a FastAPI app exposing:
-   - GET /health  -> returns {{"status": "ok", "version": 1}}
-   - GET /data    -> returns {{"items": [1, 2, 3], "count": 3}}
+# Ensure workspace exists
+Path(WORK_DIR).mkdir(parents=True, exist_ok=True)
 
-2. Create /tmp/demo-api/requirements.txt with:
+
+# ============================================================
+# Helpers — gather signals for the next iteration
+# ============================================================
+
+def get_pod_logs() -> str:
+    """Grab the last 40 lines of demo-api pod logs."""
+    try:
+        result = subprocess.run(
+            ["kubectl", "logs", "-l", "app=demo-api", "--tail=40", "--all-containers=true"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.stdout.strip() or "(no logs yet)"
+    except Exception as e:
+        return f"(could not fetch logs: {e})"
+
+
+def get_pod_status() -> str:
+    """Get the current pod status — running, restart count, etc."""
+    try:
+        result = subprocess.run(
+            ["kubectl", "get", "pods", "-l", "app=demo-api",
+             "-o", "custom-columns=NAME:.metadata.name,STATUS:.status.phase,RESTARTS:.status.containerStatuses[0].restartCount,IMAGE:.spec.containers[0].image"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.stdout.strip() or "(no pods yet)"
+    except Exception as e:
+        return f"(could not fetch status: {e})"
+
+
+def get_recent_endpoint_calls() -> str:
+    """
+    Summary of what endpoints the agent last called.
+    In a fuller version this would query OpenLIT's API; for now we read
+    the prior iteration's results.json which the agent records itself.
+    """
+    prior = Path(WORK_DIR) / "last_results.json"
+    if not prior.exists():
+        return "(no prior endpoint call data)"
+    try:
+        return prior.read_text()[:2000]
+    except Exception:
+        return "(could not read prior results)"
+
+
+def read_prior_why(iteration_n: int) -> str:
+    """Read the why-file from the previous iteration so the agent has continuity."""
+    if iteration_n <= 1:
+        return "(this is the first iteration — no prior history)"
+    prior = Path(WORK_DIR) / f"iteration_{iteration_n - 1}_why.md"
+    if prior.exists():
+        return prior.read_text()
+    return "(no prior why-file)"
+
+
+# ============================================================
+# Prompts
+# ============================================================
+
+ITERATION_1_PROMPT = """
+You are starting iteration 1 of a closed-loop SDLC demo. There is no prior state.
+
+Build the v1 baseline FastAPI service and deploy it to Kubernetes.
+
+DO THESE STEPS IN ORDER, confirming each before moving to the next:
+
+1. Create /tmp/demo-api/main.py — FastAPI app with EXACTLY these endpoints:
+   - GET /health   -> {"status": "ok"}
+   - GET /version  -> {"version": "v1", "iteration": 1, "improvements_since_v1": []}
+   - GET /data     -> {"items": [1, 2, 3], "count": 3}
+
+   IMPORTANT: Use plain print() for logging (no structured logging yet —
+   that's deliberately left as an improvement opportunity for later iterations).
+
+2. Save a snapshot: cp /tmp/demo-api/main.py /tmp/demo-api/main.py.v1
+
+3. Create /tmp/demo-api/requirements.txt:
    fastapi
    uvicorn
 
-3. Create /tmp/demo-api/Dockerfile:
+4. Create /tmp/demo-api/Dockerfile:
    FROM python:3.12-slim
    WORKDIR /app
    COPY requirements.txt .
@@ -40,73 +138,132 @@ After each step, briefly confirm it succeeded before moving on.
    EXPOSE 8080
    CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
 
-4. Create /tmp/demo-api/k8s.yaml with a Deployment and a NodePort Service.
-   Critical settings:
-   - image: demo-api:latest
-   - imagePullPolicy: IfNotPresent      (Colima k3s uses local Docker images automatically)
-   - container port: 8080
-   - service type: NodePort
-   - nodePort: 30080
-   - labels: app=demo-api
+5. Create /tmp/demo-api/k8s.yaml with a Deployment + NodePort Service:
+   - image: demo-api:v1
+   - imagePullPolicy: IfNotPresent
+   - container port 8080, NodePort 30080
+   - labels app=demo-api
 
-5. Build the Docker image:
-   docker build -t demo-api:latest /tmp/demo-api/
+6. Build: docker build -t demo-api:v1 /tmp/demo-api/
 
-6. Apply the manifest:
-   kubectl apply -f /tmp/demo-api/k8s.yaml
+7. Apply: kubectl apply -f /tmp/demo-api/k8s.yaml
 
-7. Wait for the pod to be ready:
-   kubectl wait --for=condition=ready pod -l app=demo-api --timeout=60s
+8. Wait for the pod: kubectl wait --for=condition=ready pod -l app=demo-api --timeout=90s
 
-8. Show the pod and service status:
-   kubectl get pods -l app=demo-api
-   kubectl get svc demo-api
-
-9. Call both endpoints via the Colima VM IP ({COLIMA_IP}):
-   curl -s http://{COLIMA_IP}:30080/health
-   curl -s http://{COLIMA_IP}:30080/data
-
-   If those time out, use port-forward as fallback:
+9. Call all endpoints (use port-forward if NodePort doesn't work):
    kubectl port-forward svc/demo-api 8090:8080 &
-   sleep 2
+   sleep 3
    curl -s http://localhost:8090/health
+   curl -s http://localhost:8090/version
    curl -s http://localhost:8090/data
-   kill %1   # stop the port-forward
+   pkill -f "port-forward.*demo-api" 2>/dev/null
 
-10. Write /tmp/demo-api/results.json containing:
-    {{
-      "health_response": "<actual curl output>",
-      "data_response": "<actual curl output>",
-      "pod_status": "<output of kubectl get pods>",
-      "endpoint_used": "<NodePort or port-forward>"
-    }}
-"""
+10. Write /tmp/demo-api/last_results.json with the actual curl outputs.
 
-ITERATION_2_TASK = """
-The previous iteration deployed a FastAPI service to Kubernetes and recorded
-results in /tmp/demo-api/results.json.
-
-Now do the analysis loop:
-
-1. Read /tmp/demo-api/results.json and parse it
-
-2. Get the pod logs:
-   kubectl logs -l app=demo-api --tail=30
-
-3. Verify both /health and /data returned the expected JSON shapes
-
-4. Write /tmp/demo-api/analysis.md containing:
-   - Summary: what was deployed and which endpoint method worked
-   - Verification: were the responses correct?
-   - Logs: 2-3 line summary of what the pod logs show
-   - Issues: anything weird or unexpected
-   - Improvements: three concrete next-iteration improvements
-     (e.g. add /metrics endpoint, add structured logging, add liveness probe)
+11. Write /tmp/demo-api/iteration_1_why.md containing:
+    # Iteration 1 — Baseline (v1)
+    
+    ## What was built
+    Minimal FastAPI service with /health, /version, /data endpoints.
+    
+    ## Endpoints active
+    /health, /version, /data
+    
+    ## Known limitations (opportunities for next iteration)
+    - No structured logging (plain print only)
+    - No /metrics endpoint
+    - No error handling
+    - No input validation
+    - /data returns hard-coded items
 """
 
 
-def run_agent(task: str, label: str) -> None:
-    print(f"\n{'='*70}\n  {label}\n{'='*70}\n")
+def build_iteration_n_prompt(n: int, pod_logs: str, pod_status: str,
+                              prior_results: str, prior_why: str) -> str:
+    return f"""
+You are on iteration {n} of {NUM_ITERATIONS} in a closed-loop SDLC demo.
+The service is already deployed from iteration {n - 1}. Your job is to
+OBSERVE its actual behavior and EVOLVE the code to improve it.
+
+# Observed state of the running service
+
+## Current pod status
+{pod_status}
+
+## Recent pod logs (last 40 lines)
+{pod_logs}
+
+## Previous iteration's endpoint call results
+{prior_results}
+
+## Previous iteration's why-file
+{prior_why}
+
+# Your task
+
+1. Read /tmp/demo-api/main.py (the current deployed code).
+
+2. Based on the OBSERVED state above, pick ONE concrete improvement.
+   Examples (pick one that the telemetry/logs actually motivate):
+   - Add structured JSON logging if the logs are plain text and hard to parse
+   - Add a /metrics endpoint exposing request counts and latency
+   - Add input validation if you see suspicious requests
+   - Add error handling around /data
+   - Add a /slow endpoint to make latency variation observable
+   - Add a request_id field to logs for traceability
+   - Add a readiness probe handler distinct from /health
+
+3. Modify /tmp/demo-api/main.py to implement that ONE improvement.
+
+4. UPDATE /version to reflect the new state:
+   - bump version to "v{n}"
+   - set iteration to {n}
+   - append your improvement to improvements_since_v1
+
+5. Save a versioned snapshot: cp /tmp/demo-api/main.py /tmp/demo-api/main.py.v{n}
+
+6. Build: docker build -t demo-api:v{n} /tmp/demo-api/
+
+7. Update k8s.yaml so the Deployment uses image: demo-api:v{n}
+   Then apply: kubectl apply -f /tmp/demo-api/k8s.yaml
+
+8. Wait for the rollout: kubectl rollout status deployment/demo-api --timeout=90s
+
+9. Call all endpoints (use port-forward 8090:8080 like before).
+   Include any NEW endpoint you added.
+
+10. Write /tmp/demo-api/last_results.json with the actual curl outputs.
+
+11. Write /tmp/demo-api/iteration_{n}_why.md containing:
+    # Iteration {n} — v{n}
+    
+    ## Observed signal that motivated this change
+    <quote the exact line/data from pod logs or pod status or prior results
+     that drove your decision. Be specific — point at it.>
+    
+    ## Change made
+    <describe the code change>
+    
+    ## Endpoints active after this iteration
+    <list>
+    
+    ## What to look for next iteration
+    <propose what the next iteration should observe and improve>
+
+BE SPECIFIC about which observed signal motivated your choice. The whole point
+of this iteration is to demonstrate that the change was driven by telemetry,
+not by random choice.
+"""
+
+
+# ============================================================
+# Agent runner
+# ============================================================
+
+def run_iteration(n: int, task: str) -> None:
+    banner = f" ITERATION {n} of {NUM_ITERATIONS} "
+    bar = "=" * 70
+    print(f"\n{bar}\n{banner.center(70, '=')}\n{bar}\n")
 
     agent = Agent(
         llm=llm,
@@ -120,15 +277,56 @@ def run_agent(task: str, label: str) -> None:
     conversation.run()
 
 
-# Run the loop
-print(f"Starting demo loop. Colima IP: {COLIMA_IP}")
-run_agent(ITERATION_1_TASK, "ITERATION 1 — Build & Deploy")
-run_agent(ITERATION_2_TASK, "ITERATION 2 — Analyze & Plan")
+# ============================================================
+# Main loop
+# ============================================================
 
-print("\n" + "="*70)
-print("DEMO COMPLETE")
-print("="*70)
-print(f"  Results:    /tmp/demo-api/results.json")
-print(f"  Analysis:   /tmp/demo-api/analysis.md")
-print(f"  Live API:   http://{COLIMA_IP}:30080/health")
-print(f"  Telemetry:  http://localhost:3000")
+def main():
+    print(f"Closed-loop SDLC demo — {NUM_ITERATIONS} iterations")
+    print(f"Workspace: {WORK_DIR}")
+    print(f"Model: {LLM_MODEL}")
+    print(f"OTLP: {os.getenv('OTEL_EXPORTER_OTLP_ENDPOINT')}")
+
+    # ----- Iteration 1: baseline -----
+    run_iteration(1, ITERATION_1_PROMPT)
+
+    # Brief pause so the v1 deployment can emit some logs/traces
+    time.sleep(5)
+
+    # ----- Iterations 2..N: feedback-driven -----
+    for n in range(2, NUM_ITERATIONS + 1):
+        pod_logs = get_pod_logs()
+        pod_status = get_pod_status()
+        prior_results = get_recent_endpoint_calls()
+        prior_why = read_prior_why(n)
+
+        task = build_iteration_n_prompt(n, pod_logs, pod_status, prior_results, prior_why)
+        run_iteration(n, task)
+
+        # Pause between iterations so signals settle
+        time.sleep(5)
+
+    # ----- Summary -----
+    print("\n" + "=" * 70)
+    print(" DEMO COMPLETE ".center(70, "="))
+    print("=" * 70 + "\n")
+
+    print("Evidence of code evolution — diff the snapshots:")
+    for n in range(2, NUM_ITERATIONS + 1):
+        print(f"  diff {WORK_DIR}/main.py.v{n - 1} {WORK_DIR}/main.py.v{n}")
+
+    print("\nWhy each iteration changed what it changed:")
+    for n in range(1, NUM_ITERATIONS + 1):
+        print(f"  cat {WORK_DIR}/iteration_{n}_why.md")
+
+    print("\nLive service shows current iteration:")
+    print("  kubectl port-forward svc/demo-api 8090:8080 &")
+    print("  curl http://localhost:8090/version")
+
+    print("\nTelemetry — see the LLM calls that drove each iteration:")
+    print("  http://localhost:3000  (Traces tab, filter by time)")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()

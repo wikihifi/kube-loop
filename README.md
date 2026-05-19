@@ -47,6 +47,8 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
+If colima setup is causing issues on mac, use rancher setup  setup_rancher.sh 
+
 The following instructions are more hands-on installation steps that describe how the stack is setup.
 
 ```bash
