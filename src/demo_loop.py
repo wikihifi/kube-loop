@@ -282,6 +282,19 @@ def run_iteration(n: int, task: str) -> None:
 # ============================================================
 
 def main():
+    import shutil
+    if Path(WORK_DIR).exists():
+        shutil.rmtree(WORK_DIR)
+    Path(WORK_DIR).mkdir(parents=True, exist_ok=True)
+
+    # Also clean any leftover demo-api deployment from prior runs
+    subprocess.run(["kubectl", "delete", "deployment", "demo-api",
+                    "--ignore-not-found=true"], capture_output=True)
+    subprocess.run(["kubectl", "delete", "service", "demo-api",
+                    "--ignore-not-found=true"], capture_output=True)
+
+    print(f"Closed-loop SDLC demo — {NUM_ITERATIONS} iterations")
+
     print(f"Closed-loop SDLC demo — {NUM_ITERATIONS} iterations")
     print(f"Workspace: {WORK_DIR}")
     print(f"Model: {LLM_MODEL}")
@@ -330,3 +343,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
